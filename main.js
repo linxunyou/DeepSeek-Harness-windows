@@ -33,8 +33,9 @@ class DeepSeekApp {
     this.mBackendAuthToken = '';
     this.mPnpmCommand = '';
     this.mIsQuitting = false;
+    this.mDeploying = false;
     this.mUpdateChecked = false;
-    this.mAppVersion = '1.1.0';
+    this.mAppVersion = '1.1.1';
     this.mAppRepo = 'linxunyou/DeepSeek-Harness-windows';
     this.workDir = app.isPackaged
       ? path.dirname(app.getPath('exe'))
@@ -105,7 +106,9 @@ class DeepSeekApp {
     this.createTray();
     try {
       if (!this.isDeployed()) {
+        this.mDeploying = true;
         await this.deploy();
+        this.mDeploying = false;
       }
       await this.startBackend();
       await this.waitForBackend();
@@ -184,6 +187,47 @@ class DeepSeekApp {
     fs.writeFileSync(path.join(this.dshDir, '.dsh_version'), version);
   }
 
+
+  async downloadBundle(targetVersion, statusWindow) {
+    const bundleUrl = `https://github.com/${this.mAppRepo}/releases/download/${targetVersion}/dsh-bundle.zip`;
+    this.sendStatus(statusWindow, '正在下载预编译包...', 10);
+    const zipPath = path.join(this.workDir, 'dsh-env', 'dsh-bundle.zip');
+    try {
+      await new Promise((resolve, reject) => {
+        const doRequest = (url) => {
+          https.get(url, { headers: { 'User-Agent': 'DeepSeek-Harness-App' }, timeout: 30000 }, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) { doRequest(res.headers.location); return; }
+            if (res.statusCode !== 200) { reject(new Error('Bundle not found: ' + res.statusCode)); return; }
+            const totalSize = parseInt(res.headers['content-length'], 10);
+            let downloaded = 0;
+            const file = fs.createWriteStream(zipPath);
+            res.on('data', (chunk) => {
+              downloaded += chunk.length;
+              if (totalSize) {
+                const pct = Math.round((downloaded / totalSize) * 100);
+                this.sendStatus(statusWindow, `正在下载... ${pct}%`, 10 + Math.floor(pct * 0.3));
+              }
+            });
+            res.pipe(file);
+            file.on('finish', () => { file.close(); resolve(); });
+          }).on('error', reject);
+        };
+        doRequest(bundleUrl);
+      });
+      this.sendStatus(statusWindow, '正在解压...', 45);
+      await this.runCommand('powershell.exe', ['-NoProfile', '-Command',
+        `Expand-Archive -LiteralPath "${zipPath}" -DestinationPath "${path.join(this.workDir, 'dsh-env', 'deepseek-harness')}" -Force`],
+        this.workDir, { timeout: 120000 });
+      fs.unlinkSync(zipPath);
+      return true;
+    } catch (e) {
+      console.log('[Bundle] Download failed, falling back to source build:', e.message);
+      if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+      if (fs.existsSync(this.dshDir)) fs.rmSync(this.dshDir, { recursive: true, force: true });
+      return false;
+    }
+  }
+
   async deploy() {
     const deployWindow = new BrowserWindow({
       width: 600, height: 300, title: '正在部署 DeepSeek Harness', resizable: false,
@@ -196,6 +240,19 @@ class DeepSeekApp {
         fs.mkdirSync(path.join(this.workDir, 'dsh-env'), { recursive: true });
       }
       const targetVersion = await this.getLatestStableVersion() || mDefaultDshVersion;
+
+      // Try downloading pre-built bundle first
+      if (!fs.existsSync(this.dshDir)) {
+        const bundleOk = await this.downloadBundle(targetVersion, deployWindow);
+        if (bundleOk) {
+          this.setCurrentVersion(targetVersion);
+          this.sendStatus(deployWindow, '部署完成！', 100);
+          setTimeout(() => deployWindow.close(), 1500);
+          return;
+        }
+      }
+
+      // Fallback: source build
       const mirrors = [
         'https://ghfast.top/https://github.com/deepseek-ai/deepseek-harness.git',
         'https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness.git',
@@ -343,7 +400,7 @@ class DeepSeekApp {
   createTray() {
     this.tray = new Tray(path.join(__dirname, 'icon.ico'));
     const contextMenu = Menu.buildFromTemplate([
-      { label: '显示窗口', click: () => { if (this.mainWindow) this.mainWindow.show(); else this.createMainWindow(); } },
+      { label: '显示窗口', click: () => { if (this.mDeploying) return; if (this.mainWindow) this.mainWindow.show(); else this.createMainWindow(); } },
       { label: '重启服务', click: async () => {
         try {
           this.stopBackend(); this.mBackendAuthToken = '';
@@ -362,7 +419,9 @@ class DeepSeekApp {
           try {
             this.stopBackend(); fs.rmSync(this.dshDir, { recursive: true, force: true });
             this.mBackendAuthToken = '';
+            this.mDeploying = true;
             await this.deploy(); await this.startBackend(); await this.waitForBackend();
+            this.mDeploying = false;
             if (this.mainWindow) this.mainWindow.loadURL(this.mBackendAuthToken || this.backendUrl);
             else this.createMainWindow();
           } catch (error) { dialog.showErrorBox('重新部署失败', error.message); }
@@ -374,7 +433,7 @@ class DeepSeekApp {
     ]);
     this.tray.setToolTip('DeepSeek Harness 桌面版');
     this.tray.setContextMenu(contextMenu);
-    this.tray.on('double-click', () => { if (this.mainWindow) this.mainWindow.show(); else this.createMainWindow(); });
+    this.tray.on('double-click', () => { if (this.mDeploying) return; if (this.mainWindow) this.mainWindow.show(); else this.createMainWindow(); });
   }
 
   async checkForUpdates(silent = false) {
@@ -406,19 +465,36 @@ class DeepSeekApp {
     updateWindow.loadFile('deploy.html');
     try {
       this.stopBackend();
-      this.sendStatus(updateWindow, '正在更新到 ' + latestVersion + '...', 20);
+      this.sendStatus(updateWindow, '正在更新到 ' + latestVersion + '...', 5);
+
+      // Try downloading pre-built bundle first
+      if (fs.existsSync(this.dshDir)) fs.rmSync(this.dshDir, { recursive: true, force: true });
+      const bundleOk = await this.downloadBundle(latestVersion, updateWindow);
+      if (bundleOk) {
+        this.setCurrentVersion(latestVersion);
+        this.sendStatus(updateWindow, '正在重启服务...', 95);
+        await this.startBackend(); await this.waitForBackend();
+        this.sendStatus(updateWindow, '更新完成！', 100);
+        setTimeout(() => { updateWindow.close(); if (this.mainWindow) this.mainWindow.reload(); }, 2000);
+        return;
+      }
+
+      // Fallback: source build
+      this.sendStatus(updateWindow, '正在下载源码...', 20);
       const mirrors = [
         'https://ghfast.top/https://github.com/deepseek-ai/deepseek-harness.git',
         'https://ghproxy.net/https://github.com/deepseek-ai/deepseek-harness.git',
         'https://github.com/deepseek-ai/deepseek-harness.git'
       ];
-      let fetched = false;
+      let cloned = false;
       for (const mirror of mirrors) {
-        try { await this.runCommand('git', ['fetch', mirror, '--tags', '--force'], this.dshDir, { timeout: 120000 }); fetched = true; break; }
-        catch (e) { continue; }
+        try {
+          await this.runCommand('git', ['clone', '--depth', '1', '--branch', latestVersion, mirror, 'deepseek-harness'],
+            path.join(this.workDir, 'dsh-env'), { timeout: 300000 });
+          cloned = true; break;
+        } catch (e) { continue; }
       }
-      if (!fetched) throw new Error('所有镜像均无法获取更新');
-      await this.runCommand('git', ['checkout', latestVersion], this.dshDir, { timeout: 60000 });
+      if (!cloned) throw new Error('所有镜像均无法获取更新');
       this.setCurrentVersion(latestVersion);
       this.sendStatus(updateWindow, '正在安装依赖...', 50);
       await this.runCommand(this.getPnpmCommand(), this.getPnpmArgs(['install', '--registry=https://registry.npmmirror.com']), this.dshDir, { timeout: 900000 });
